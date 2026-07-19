@@ -2,7 +2,9 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import IOKit.hid
+import Darwin
 
+private let toolVersion = "0.3.0"
 private let vendorID = 0x05AC
 private let productID = 0x024F
 private let controlUsagePage = 0xFF13
@@ -39,6 +41,10 @@ struct PreparedAnimation {
     let frameCount: Int
     let blockCount: Int
     let delayUnits: [UInt8]
+}
+
+struct ImageConfiguration: Codable {
+    var images: [String: String] = [:]
 }
 
 final class InputAckState {
@@ -344,6 +350,48 @@ private func waitForInputAck(_ state: InputAckState, timeout: TimeInterval) -> B
     return state.received && state.result == kIOReturnSuccess
 }
 
+final class UploadProgress {
+    private let total: Int
+    private let barWidth = 24
+    private let interactive = isatty(STDOUT_FILENO) != 0
+    private var lineIsOpen = false
+
+    init(total: Int) {
+        self.total = max(1, total)
+    }
+
+    func update(current: Int) {
+        let boundedCurrent = min(max(0, current), total)
+        let fraction = Double(boundedCurrent) / Double(total)
+        let percent = Int(fraction * 100.0)
+        let filled = boundedCurrent == total
+            ? barWidth
+            : min(barWidth, max(1, Int(fraction * Double(barWidth))))
+        let bar = String(repeating: "█", count: filled)
+            + String(repeating: "░", count: barWidth - filled)
+        let line = "上傳中 [\(bar)] \(String(format: "%3d", percent))% (\(boundedCurrent)/\(total))"
+
+        if interactive {
+            fputs("\r\(line)", stdout)
+            lineIsOpen = true
+            if boundedCurrent == total {
+                fputs("\n", stdout)
+                lineIsOpen = false
+            }
+            fflush(stdout)
+        } else if boundedCurrent == total {
+            print(line)
+        }
+    }
+
+    func finish() {
+        guard interactive, lineIsOpen else { return }
+        fputs("\n", stdout)
+        fflush(stdout)
+        lineIsOpen = false
+    }
+}
+
 private func upload(_ animation: PreparedAnimation, slot: Int, devices: [IOHIDDevice]) throws {
     guard (1...255).contains(slot) else { throw ToolError.usage("slot 必須介於 1...255") }
     guard animation.blockCount <= 0xFFFF else { throw ToolError.image("轉換後資料太大") }
@@ -387,6 +435,8 @@ private func upload(_ animation: PreparedAnimation, slot: Int, devices: [IOHIDDe
         ], to: channels.control)
 
         let total = animation.blockCount
+        let progress = UploadProgress(total: total)
+        defer { progress.finish() }
         for block in 0..<total {
             let start = block * transferBlockSize
             let end = start + transferBlockSize
@@ -417,10 +467,7 @@ private func upload(_ animation: PreparedAnimation, slot: Int, devices: [IOHIDDe
                 throw ToolError.io("第 \(block + 1)/\(total) 個資料區塊收到無效 ACK：\(dump)")
             }
 
-            if block == 0 || block + 1 == total || (block + 1) % max(1, total / 20) == 0 {
-                let percent = Int(Double(block + 1) / Double(total) * 100.0)
-                print("上傳中：\(percent)% (\(block + 1)/\(total))")
-            }
+            progress.update(current: block + 1)
         }
 
         try sendFeature([0x04, 0x02], to: channels.control)
@@ -432,18 +479,189 @@ private func argument(after flag: String, in arguments: [String]) -> String? {
     return arguments[index + 1]
 }
 
+private let configurationDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".config", isDirectory: true)
+    .appendingPathComponent("omo", isDirectory: true)
+
+private let configurationFileURL = configurationDirectoryURL
+    .appendingPathComponent("config.json", isDirectory: false)
+
+private func loadImageConfiguration() throws -> ImageConfiguration {
+    guard FileManager.default.fileExists(atPath: configurationFileURL.path) else {
+        return ImageConfiguration()
+    }
+
+    do {
+        let data = try Data(contentsOf: configurationFileURL)
+        return try JSONDecoder().decode(ImageConfiguration.self, from: data)
+    } catch {
+        throw ToolError.io("無法讀取設定檔：\(configurationFileURL.path)\n\(error.localizedDescription)")
+    }
+}
+
+private func saveImageConfiguration(_ configuration: ImageConfiguration) throws {
+    do {
+        try FileManager.default.createDirectory(
+            at: configurationDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(configuration)
+        try data.write(to: configurationFileURL, options: .atomic)
+    } catch {
+        throw ToolError.io("無法寫入設定檔：\(configurationFileURL.path)\n\(error.localizedDescription)")
+    }
+}
+
+private func imageURL(from path: String) -> URL {
+    let expandedPath = (path as NSString).expandingTildeInPath
+    if expandedPath.hasPrefix("/") {
+        return URL(fileURLWithPath: expandedPath).standardizedFileURL
+    }
+    let workingDirectory = URL(
+        fileURLWithPath: FileManager.default.currentDirectoryPath,
+        isDirectory: true
+    )
+    return URL(fileURLWithPath: expandedPath, relativeTo: workingDirectory).standardizedFileURL
+}
+
+private func isExistingFile(at url: URL) -> Bool {
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+        && !isDirectory.boolValue
+}
+
+private func requireExistingImage(at url: URL, name: String? = nil) throws {
+    guard isExistingFile(at: url) else {
+        if let name {
+            throw ToolError.image(
+                "設定「\(name)」指向的圖片不存在：\(url.path)\n" +
+                "請使用 omo config set \(name) <有效圖片路徑> 更新設定。"
+            )
+        }
+        throw ToolError.image("圖片不存在：\(url.path)")
+    }
+}
+
+private func runConfigurationCommand(_ arguments: [String]) throws {
+    let action = arguments.first ?? "list"
+    var configuration = try loadImageConfiguration()
+
+    switch action {
+    case "set":
+        guard arguments.count == 3 else {
+            throw ToolError.usage("用法：omo config set <名稱> <圖片路徑>")
+        }
+        let name = arguments[1]
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ToolError.usage("圖片名稱不能是空白。")
+        }
+        let url = imageURL(from: arguments[2])
+        try requireExistingImage(at: url)
+        configuration.images[name] = url.path
+        try saveImageConfiguration(configuration)
+        print("已設定：\(name) → \(url.path)")
+
+    case "remove":
+        guard arguments.count == 2 else {
+            throw ToolError.usage("用法：omo config remove <名稱>")
+        }
+        let name = arguments[1]
+        guard configuration.images.removeValue(forKey: name) != nil else {
+            throw ToolError.usage("找不到圖片名稱「\(name)」。")
+        }
+        try saveImageConfiguration(configuration)
+        print("已移除：\(name)")
+
+    case "list":
+        guard arguments.isEmpty || arguments.count == 1 else {
+            throw ToolError.usage("用法：omo config list")
+        }
+        if configuration.images.isEmpty {
+            print("尚未設定圖片。\n使用 omo config set <名稱> <圖片路徑> 新增。")
+            return
+        }
+        for name in configuration.images.keys.sorted() {
+            let path = configuration.images[name] ?? ""
+            let valid = isExistingFile(at: imageURL(from: path))
+            print("\(name)\t\(valid ? "" : "[路徑失效] ")\(path)")
+        }
+
+    case "path":
+        guard arguments.count == 1 else {
+            throw ToolError.usage("用法：omo config path")
+        }
+        print(configurationFileURL.path)
+
+    default:
+        throw ToolError.usage("用法：omo config <set|remove|list|path>")
+    }
+}
+
+private func chooseConfiguredImage(
+    from configuration: ImageConfiguration
+) throws -> String? {
+    let names = configuration.images.keys.sorted()
+    guard !names.isEmpty else {
+        throw ToolError.usage(
+            "尚未設定圖片。\n" +
+            "請先使用 omo config set <名稱> <圖片路徑>。"
+        )
+    }
+    guard isatty(STDIN_FILENO) != 0 else {
+        throw ToolError.usage(
+            "非互動模式需要指定圖片名稱。\n" +
+            "用法：omo set <名稱> [--slot 1]"
+        )
+    }
+
+    print("選擇要上傳的圖片：")
+    for (index, name) in names.enumerated() {
+        let path = configuration.images[name] ?? ""
+        let suffix = isExistingFile(at: imageURL(from: path)) ? "" : " [路徑失效]"
+        print("  \(index + 1). \(name)\(suffix)")
+    }
+    print("")
+
+    while true {
+        fputs("輸入編號（q 取消）： ", stdout)
+        fflush(stdout)
+        guard let rawInput = readLine() else {
+            print("已取消。")
+            return nil
+        }
+        let input = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if input.lowercased() == "q" {
+            print("已取消。")
+            return nil
+        }
+        if let number = Int(input), (1...names.count).contains(number) {
+            return names[number - 1]
+        }
+        print("請輸入 1–\(names.count)，或 q 取消。")
+    }
+}
+
 private let usage = """
 OMO100 macOS 螢幕工具（逆向 Beta）
 
 用法：
-  omo100-tool list
-  omo100-tool prepare <圖片或 GIF> [--output payload.bin]
-  omo100-tool upload <圖片或 GIF> [--slot 1] --yes-really-upload
+  omo list
+  omo prepare <圖片或 GIF> [--output payload.bin]
+  omo upload <圖片或 GIF> [--slot 1] --yes-really-upload
+  omo config set <名稱> <圖片路徑>
+  omo config list
+  omo config remove <名稱>
+  omo set [名稱] [--slot 1]
+  omo --version
 
 說明：
   list      只讀取 USB/HID 描述，不會改變鍵盤。
   prepare   轉成 96x160、RGB565、4096-byte 分段資料，不接觸鍵盤。
   upload    覆寫指定 TFT 圖片槽；目前 OMO100 設定只有 1 槽。
+  config    管理圖片名稱與路徑；設定檔位於 ~/.config/omo/config.json。
+  set       上傳 config 中的圖片；省略名稱時可從選單選擇。
 """
 
 private func run() throws {
@@ -451,6 +669,9 @@ private func run() throws {
     let command = arguments.first ?? "list"
 
     switch command {
+    case "--version", "version":
+        print("OMO100 Tool for MacOS \(toolVersion)")
+
     case "list":
         describeDevices(try matchingDevices())
 
@@ -466,6 +687,37 @@ private func run() throws {
         if prepared.sourceFrameCount > maximumFrameCount {
             print("注意：原檔超過 \(maximumFrameCount) 幀，只保留前 \(maximumFrameCount) 幀。")
         }
+
+    case "config":
+        try runConfigurationCommand(Array(arguments.dropFirst()))
+
+    case "set":
+        let configuration = try loadImageConfiguration()
+        let setArguments = Array(arguments.dropFirst())
+        let explicitName = setArguments.first.flatMap { $0.hasPrefix("--") ? nil : $0 }
+        let name: String
+        if let explicitName {
+            name = explicitName
+        } else {
+            guard let selectedName = try chooseConfiguredImage(from: configuration) else {
+                return
+            }
+            name = selectedName
+        }
+        guard let path = configuration.images[name] else {
+            throw ToolError.usage(
+                "找不到圖片名稱「\(name)」。\n" +
+                "請先執行 omo config set \(name) <圖片路徑>。"
+            )
+        }
+        let inputURL = imageURL(from: path)
+        try requireExistingImage(at: inputURL, name: name)
+        let slot = Int(argument(after: "--slot", in: arguments) ?? "1") ?? 1
+        let prepared = try prepareAnimation(at: inputURL)
+        print("使用設定：\(name) → \(inputURL.path)")
+        print("準備上傳 \(prepared.frameCount) 幀、\(prepared.blockCount) 個區塊到 slot \(slot)。")
+        try upload(prepared, slot: slot, devices: try matchingDevices())
+        print("完成。鍵盤已接受所有區塊與結束命令。")
 
     case "upload":
         guard arguments.count >= 2, arguments.contains("--yes-really-upload") else {

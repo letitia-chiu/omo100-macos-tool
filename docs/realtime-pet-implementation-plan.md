@@ -8,7 +8,7 @@
 在保留現有「手動選擇 PNG／JPEG／GIF 並上傳」能力的前提下，研究並實作一個 macOS 常駐橋接程式，使 OMO100 鍵盤螢幕可依下列事件切換動畫：
 
 - 使用者持續打字：播放跳躍或活動動畫。
-- 使用者停止打字：回到目前已驗證的 Xavier 眨眼動畫。
+- 使用者停止打字：回到目前已驗證的 idle 動畫。
 - Codex／Claude 開始處理、使用工具、等待批准、完成或失敗：播放對應狀態動畫。
 
 本計劃最重要的前置條件是先找到「不反覆寫入鍵盤非揮發儲存空間」的即時顯示或快速切換命令。在找到並實機證明之前，不實作高頻率狀態切換。
@@ -45,7 +45,7 @@
 - byte 1...192 是影格延遲，每單位 20ms。
 - OMO100 實機對長延遲的播放不可靠。
 - 現有工具會把來源影格展開成約 100ms 的重複硬體影格。
-- Xavier 3 個來源影格會展開為 21 個硬體影格。
+- 已驗證的本機測試 GIF（3 個來源影格）會展開為 21 個硬體影格。
 - 實拍驗證眨眼週期約 2.0～2.1 秒，方向與原 GIF 一致。
 
 ### 2.4 現有專案能力
@@ -53,9 +53,7 @@
 - `list`：唯讀列出 OMO100 HID collection。
 - `prepare`：轉換 PNG／JPEG／GIF，不接觸鍵盤。
 - `upload`：執行完整持久上傳並逐頁驗證 ACK。
-- 已有 Xavier 測試素材：
-  - `assets/xavier-calm-blink-96x160.gif`
-  - `assets/xavier-idle-96x160.gif`
+- 本機測試素材不納入公開 repository；請使用自己有權使用的 GIF 建立等價回歸測試。
 
 ### 2.5 現有協定不適合即時狀態切換
 
@@ -119,7 +117,7 @@ Claude Code hooks ────┘            │                  │
 
 - 確認專案目前不是 Git repository；在開始實作前由使用者決定是否初始化本機 Git。
 - 記錄現有檔案、編譯命令、CLI 行為與已知實機證據。
-- 對現有 Xavier payload 產生 hash 與 header 摘要，作為未來回歸依據。
+- 對現有已驗證 payload 產生 hash 與 header 摘要，作為未來回歸依據。
 - 此步驟不修改程式、不碰硬體 write。
 
 #### 0B. 基線測試建設
@@ -127,7 +125,7 @@ Claude Code hooks ────┘            │                  │
 只在 0A／1A 調查報告完成並確認下一步後執行：
 
 - 將協定常數與 payload 編碼從 CLI 流程拆成可測試的純函式，但不可改變現有輸出。
-- 保存一份 Xavier 已知正確 payload fixture，驗證：
+- 保存一份已知正確 payload fixture，驗證：
   - 96 × 160
   - 垂直翻轉、左右不鏡像
   - 21 個硬體影格
@@ -240,7 +238,7 @@ protocol LiveDisplayTransport {
 #### 初始狀態
 
 ```text
-idle              Xavier 眨眼
+idle              預設 idle 動畫
 typing            跳躍／活動
 agentThinking     思考或左右張望
 toolRunning       工作／跑步
@@ -365,7 +363,7 @@ MVP 穩定後再考慮：
 - start at login。
 - USB 連線狀態與錯誤提示。
 - 手動 preview。
-- 恢復預設 Xavier idle。
+- 恢復預設 idle 動畫。
 
 GUI 必須清楚區分：
 
@@ -454,17 +452,12 @@ GUI 必須清楚區分：
 - 不修改目前已驗證的 `upload` 協定。
 - 不建立會頻繁呼叫 `upload` 的常駐程式。
 
-## 10. 相關路徑
+## 10. 相關資料
 
-- 專案：`/Users/tzuhsuan/code/omo100-macos`
-- 主程式：`/Users/tzuhsuan/code/omo100-macos/OMO100Tool.swift`
-- README：`/Users/tzuhsuan/code/omo100-macos/README.md`
-- Windows installer：`/Users/tzuhsuan/Downloads/OMO100 Driver-1.0.0.2(1).exe`
-- 已解壓 Windows app：`/Users/tzuhsuan/Documents/Codex/2026-07-16/new-chat/work/omo100-extracted/app`
-- Windows driver executable：`/Users/tzuhsuan/Documents/Codex/2026-07-16/new-chat/work/omo100-extracted/app/DeviceDriver.exe`
-- Xavier spritesheet：`/Users/tzuhsuan/.codex/pets/xavier/spritesheet.webp`
-- 最終方向／速度實拍：`/Users/tzuhsuan/Downloads/805910902.447987.mp4`
-- 初次快速眨眼實拍：`/Users/tzuhsuan/Downloads/IMG_7012.MOV`
+- 專案主程式：[`../OMO100Tool.swift`](../OMO100Tool.swift)
+- 使用說明：[`../README.md`](../README.md)
+- 靜態逆向報告：[`research/phase-1a-static-reverse-report.md`](research/phase-1a-static-reverse-report.md)
+- 供應商 installer、解壓後的 Windows app、實機錄影及個人測試素材均為本機研究資料，不放入 repository。請只使用你有權取得與使用的副本，並將中間分析檔放在系統暫存目錄。
 
 ## 11. 專案操作規則
 
