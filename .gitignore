@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Swift build artifacts and local caches
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Generated OMO100 image payloads
+*.omo100.bin
