@@ -10,3 +10,19 @@ xcuserdata/
 
 # Generated OMO100 image payloads
 *.omo100.bin
+
+# Locally built command-line tool
+/omo100-tool
+
+# Private, machine-specific OMO100 settings. The tool's default settings live
+# outside this repository at ~/.config/omo/config.json; these rules prevent an
+# accidental in-repo copy from being staged.
+/.omo100/
+/omo100.local.json
+/config.local.json
+/.env
+/.env.*
+!/.env.example
+
+# Local test media; publish only assets with an explicit redistributable license.
+assets/
