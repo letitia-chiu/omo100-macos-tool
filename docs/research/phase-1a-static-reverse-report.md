@@ -43,10 +43,19 @@
 ### 尚待 capture 或實機驗證
 
 - 點擊 LCD `Preview`、切換 slot、切換 frame、開始／停止預覽時，USB bus 是否完全無封包。
-- `04 28` 及後續時間 report 的實際 feature GET 回傳內容。
 - 官方 Windows app 的每個 4096-byte page read-back 是否實際回 `01 5A 02`；Windows wrapper 讀取後沒有驗證內容。
 - 是否存在由 `mui.dll` 內部觸發、而未在 `DeviceDriver.exe` 直接顯示的 HID 路徑。現有 import／handle 架構使此可能性偏低，但本次沒有把 `mui.dll` 當第二個完整逆向標的。
 - firmware update 路徑與本報告列出的 TFT 路徑是否共享更底層 transport；這不構成可測試 TFT 命令的證據。
+
+### 2.1 後續實機補證（2026-07-21）
+
+在 macOS 已授與輸入監控權限的 USB 有線模式下，`omo time` 的 `04 18` 與 `04 28` 準備步驟皆通過一般 feature ACK；接著送出的 C6 時間資料，其 feature GET 回傳會是同一份時間資料，而非一般 ACK。實測回應前 11 bytes 為：
+
+```text
+00 01 5A 1A 07 15 0D 0B 10 00 02
+```
+
+它與送出的 `slot=1`、2026-07-21 13:11:16、星期二資料相符。原本 macOS CLI 把此 C6 回讀誤判成 generic ACK 失敗，因而尚未送出 `04 02`；工具已改為驗證 C6 回讀的時間欄位，然後才送 finalize。使用者尚需以修正版重跑一次，確認小螢幕顯示與重連後的保留狀態。
 
 ## 3. Phase 0A：專案基線
 
@@ -278,7 +287,7 @@ byte 10..63: 00
 
 - construction／call site：`0x004238ef` 呼叫 `GetLocalTime`；`0x0042390b..0x00423960` 組 report；`0x0042396d` 呼叫 feature wrapper。
 - report 方向／長度：control feature SET，64 bytes；接著 feature GET。
-- ACK／回傳：feature response protocol byte 3 必須為 `01`。
+- ACK／回傳：靜態 wrapper 分析原本顯示 protocol byte 3 必須為 `01`；但 2026-07-21 macOS 實機發現，C6 的 feature GET 會回讀同一份時間資料（前 11 bytes 與送出資料一致），因此不能套用 generic ACK 規則。
 - UI／字串交叉證據：`Time Syns`、`GetLocalTime`、current LCD selection。
 - 推定用途：向所選 LCD slot 寫入／同步本機日期時間 metadata。
 - 分類：含 slot 但不是顯示 slot select；與 RAM preview、live frame、frame select、play/pause、firmware update 均無證據；是否 persistent metadata 待 capture／重啟驗證。

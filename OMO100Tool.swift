@@ -4,7 +4,7 @@ import ImageIO
 import IOKit.hid
 import Darwin
 
-private let toolVersion = "0.3.0"
+private let toolVersion = "0.4.0"
 private let vendorID = 0x05AC
 private let productID = 0x024F
 private let controlUsagePage = 0xFF13
@@ -106,12 +106,6 @@ private func matchingDevices() throws -> [IOHIDDevice] {
         ],
     ]
     IOHIDManagerSetDeviceMatchingMultiple(manager, matchings as CFArray)
-
-    let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-    guard openResult == kIOReturnSuccess else {
-        throw ToolError.device("無法開啟 IOHIDManager：\(ioReturnDescription(openResult))")
-    }
-    defer { IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
 
     guard let deviceSet = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
         return []
@@ -303,7 +297,29 @@ private func chooseChannels(from devices: [IOHIDDevice]) throws -> (control: IOH
     return (control, screen)
 }
 
-private func sendFeature(_ bytes: [UInt8], to device: IOHIDDevice) throws {
+private func chooseControlChannel(from devices: [IOHIDDevice]) throws -> IOHIDDevice {
+    guard let control = devices.first(where: {
+        numberProperty($0, kIOHIDPrimaryUsagePageKey as String) == controlUsagePage &&
+        numberProperty($0, kIOHIDPrimaryUsageKey as String) == controlUsage &&
+        (numberProperty($0, kIOHIDMaxFeatureReportSizeKey as String) ?? 0) >= 64
+    }) else {
+        throw ToolError.device("找不到 OMO100 的 64-byte 控制通道（0xFF13/0x01）")
+    }
+    return control
+}
+
+private func openControlChannel(_ control: IOHIDDevice) throws {
+    let result = IOHIDDeviceOpen(control, IOOptionBits(kIOHIDOptionsTypeNone))
+    guard result == kIOReturnSuccess else {
+        throw ToolError.device(
+            "無法開啟控制通道：\(ioReturnDescription(result))。" +
+            "若是 0xE00002E2，請到「系統設定 → 隱私權與安全性 → 輸入監控」" +
+            "允許啟動 omo100-tool 的終端機或 Codex，然後重試。"
+        )
+    }
+}
+
+private func exchangeFeature(_ bytes: [UInt8], with device: IOHIDDevice) throws -> [UInt8] {
     var packet = [UInt8](repeating: 0, count: 64)
     packet.replaceSubrange(0..<min(bytes.count, packet.count), with: bytes.prefix(packet.count))
 
@@ -336,9 +352,24 @@ private func sendFeature(_ bytes: [UInt8], to device: IOHIDDevice) throws {
     guard getResult == kIOReturnSuccess else {
         throw ToolError.io("控制通道 ACK 讀取失敗：\(ioReturnDescription(getResult))")
     }
-    guard responseLength >= 4, response[3] == 1 else {
-        let dump = response.prefix(min(responseLength, 12)).map { String(format: "%02X", $0) }.joined(separator: " ")
+    return Array(response.prefix(responseLength))
+}
+
+private func sendFeature(_ bytes: [UInt8], to device: IOHIDDevice) throws {
+    let response = try exchangeFeature(bytes, with: device)
+    guard response.count >= 4, response[3] == 1 else {
+        let dump = response.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
         throw ToolError.io("控制通道拒絕命令；ACK=\(dump)")
+    }
+}
+
+private func sendTimeDataFeature(_ bytes: [UInt8], to device: IOHIDDevice) throws {
+    let response = try exchangeFeature(bytes, with: device)
+    // Unlike the begin, prepare, and finalize reports, Time Syns reads back the
+    // time data itself. The first 11 bytes carry its meaningful fields.
+    guard response.count >= 11, response.prefix(11).elementsEqual(bytes.prefix(11)) else {
+        let dump = response.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
+        throw ToolError.io("時間資料沒有正確回讀；回應=\(dump)")
     }
 }
 
@@ -397,10 +428,7 @@ private func upload(_ animation: PreparedAnimation, slot: Int, devices: [IOHIDDe
     guard animation.blockCount <= 0xFFFF else { throw ToolError.image("轉換後資料太大") }
 
     let channels = try chooseChannels(from: devices)
-    let controlOpen = IOHIDDeviceOpen(channels.control, IOOptionBits(kIOHIDOptionsTypeNone))
-    guard controlOpen == kIOReturnSuccess else {
-        throw ToolError.device("無法開啟控制通道：\(ioReturnDescription(controlOpen))")
-    }
+    try openControlChannel(channels.control)
     defer { IOHIDDeviceClose(channels.control, IOOptionBits(kIOHIDOptionsTypeNone)) }
 
     let screenOpen = IOHIDDeviceOpen(channels.screen, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -474,9 +502,115 @@ private func upload(_ animation: PreparedAnimation, slot: Int, devices: [IOHIDDe
     }
 }
 
+private func localDate(from dateText: String, time timeText: String) throws -> Date {
+    let input = "\(dateText) \(timeText)"
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    formatter.isLenient = false
+
+    guard let date = formatter.date(from: input), formatter.string(from: date) == input else {
+        throw ToolError.usage("日期時間格式無效，請使用 YYYY-MM-DD HH:MM:SS（本機時區）。")
+    }
+    return date
+}
+
+private func timeSyncPacket(for date: Date, slot: Int) throws -> [UInt8] {
+    guard (1...255).contains(slot) else { throw ToolError.usage("slot 必須介於 1...255") }
+
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = .current
+    let components = calendar.dateComponents(
+        [.year, .month, .day, .hour, .minute, .second, .weekday],
+        from: date
+    )
+    guard let year = components.year,
+          let month = components.month,
+          let day = components.day,
+          let hour = components.hour,
+          let minute = components.minute,
+          let second = components.second,
+          let weekday = components.weekday,
+          (2000...2255).contains(year) else {
+        throw ToolError.usage("支援的年份範圍為 2000...2255。")
+    }
+
+    // This exactly follows the Windows Time Syns report: slot, 0x5A,
+    // year since 2000, local date/time, Sunday=0 weekday, then AA 55.
+    var packet = [UInt8](repeating: 0, count: 64)
+    packet[1] = UInt8(slot)
+    packet[2] = 0x5A
+    packet[3] = UInt8(year - 2000)
+    packet[4] = UInt8(month)
+    packet[5] = UInt8(day)
+    packet[6] = UInt8(hour)
+    packet[7] = UInt8(minute)
+    packet[8] = UInt8(second)
+    packet[10] = UInt8(weekday - 1)
+    packet[62] = 0xAA
+    packet[63] = 0x55
+    return packet
+}
+
+private func displayTime(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss ZZZZ"
+    return formatter.string(from: date)
+}
+
+private func syncTime(_ date: Date, slot: Int, devices: [IOHIDDevice]) throws {
+    let control = try chooseControlChannel(from: devices)
+    try openControlChannel(control)
+    defer { IOHIDDeviceClose(control, IOOptionBits(kIOHIDOptionsTypeNone)) }
+
+    try sendFeature([0x04, 0x18], to: control)
+    var prepare = [UInt8](repeating: 0, count: 64)
+    prepare[0] = 0x04
+    prepare[1] = 0x28
+    prepare[8] = 0x01
+    try sendFeature(prepare, to: control)
+    try sendTimeDataFeature(try timeSyncPacket(for: date, slot: slot), to: control)
+    try sendFeature([0x04, 0x02], to: control)
+}
+
 private func argument(after flag: String, in arguments: [String]) -> String? {
     guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else { return nil }
     return arguments[index + 1]
+}
+
+private func runTimeCommand(_ arguments: [String]) throws {
+    var dryRun = false
+    var dateTimeArguments = [String]()
+    for argument in arguments {
+        switch argument {
+        case "--dry-run":
+            dryRun = true
+        default:
+            dateTimeArguments.append(argument)
+        }
+    }
+
+    guard dateTimeArguments.isEmpty || dateTimeArguments.count == 2 else {
+        throw ToolError.usage("用法：omo time [YYYY-MM-DD HH:MM:SS] [--dry-run]")
+    }
+    let date = try dateTimeArguments.isEmpty
+        ? Date()
+        : localDate(from: dateTimeArguments[0], time: dateTimeArguments[1])
+    let packet = try timeSyncPacket(for: date, slot: 1)
+    print("準備同步日期時間：\(displayTime(date))")
+
+    if dryRun {
+        let dump = packet.map { String(format: "%02X", $0) }.joined(separator: " ")
+        print("Dry run：不會寫入鍵盤。時間資料 report：\(dump)")
+        return
+    }
+    try syncTime(date, slot: 1, devices: try matchingDevices())
+    print("完成。鍵盤已接受時間同步命令。")
 }
 
 private let configurationDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
@@ -650,6 +784,7 @@ OMO100 macOS 螢幕工具（逆向 Beta）
   omo list
   omo prepare <圖片或 GIF> [--output payload.bin]
   omo upload <圖片或 GIF> [--slot 1] --yes-really-upload
+  omo time [YYYY-MM-DD HH:MM:SS] [--dry-run]
   omo config set <名稱> <圖片路徑>
   omo config list
   omo config remove <名稱>
@@ -660,6 +795,7 @@ OMO100 macOS 螢幕工具（逆向 Beta）
   list      只讀取 USB/HID 描述，不會改變鍵盤。
   prepare   轉成 96x160、RGB565、4096-byte 分段資料，不接觸鍵盤。
   upload    覆寫指定 TFT 圖片槽；目前 OMO100 設定只有 1 槽。
+  time      將 Mac 本機日期時間寫入 TFT；可直接指定日期與時間。
   config    管理圖片名稱與路徑；設定檔位於 ~/.config/omo/config.json。
   set       上傳 config 中的圖片；省略名稱時可從選單選擇。
 """
@@ -729,6 +865,9 @@ private func run() throws {
         print("準備上傳 \(prepared.frameCount) 幀、\(prepared.blockCount) 個區塊到 slot \(slot)。")
         try upload(prepared, slot: slot, devices: try matchingDevices())
         print("完成。鍵盤已接受所有區塊與結束命令。")
+
+    case "time":
+        try runTimeCommand(Array(arguments.dropFirst()))
 
     case "help", "--help", "-h":
         print(usage)
